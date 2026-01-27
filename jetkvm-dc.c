@@ -6,7 +6,15 @@
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "driver_ina219.h"
+#include "driver_ina700.h"
 #include "flash_store.h"
+
+/* Power monitor type enumeration */
+typedef enum {
+    POWER_MONITOR_NONE = 0,
+    POWER_MONITOR_INA219,
+    POWER_MONITOR_INA700
+} power_monitor_type_t;
 
 #define UART_ID uart0
 #define BAUD_RATE 115200
@@ -145,6 +153,8 @@ void on_uart_rx()
 }
 
 static ina219_handle_t ina219;
+static ina700_handle_t ina700;
+static power_monitor_type_t active_power_monitor = POWER_MONITOR_NONE;
 
 uint8_t ina219_i2c_read(uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t len) {
     printf("ina219: i2c read %d bytes from reg 0x%02x addr %d\n", len, reg, addr);
@@ -186,101 +196,221 @@ uint8_t ina219_i2c_deinit() {
     return 0;
 }
 
-uint8_t power_init() {
+/* INA700 I2C functions - reuse the same I2C bus */
+uint8_t ina700_i2c_read(uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t len) {
+    printf("ina700: i2c read %d bytes from reg 0x%02x addr 0x%02x\n", len, reg, addr);
+    int ret = i2c_write_blocking(i2c0, addr, &reg, 1, true);
+    if (ret < 0) {
+        printf("ina700: i2c write failed with error %d\n", ret);
+        return 1;
+    }
+    ret = i2c_read_blocking(i2c0, addr, buf, len, false);
+    if (ret < 0) {
+        printf("ina700: i2c read failed with error %d\n", ret);
+        return 1;
+    }
+    return 0;
+}
+
+uint8_t ina700_i2c_write(uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t len) {
+    uint8_t tmp_buf[len + 1];
+    tmp_buf[0] = reg;
+    memcpy(&tmp_buf[1], buf, len);
+    int ret = i2c_write_blocking(i2c0, addr, tmp_buf, len + 1, false);
+    if (ret < 0) {
+        return 1;
+    }
+    return 0;
+}
+
+uint8_t ina700_i2c_init() {
+    /* I2C already initialized by ina219_i2c_init or will be initialized here */
+    i2c_init(i2c0, 100000);
+    gpio_set_function(INA219_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(INA219_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(INA219_I2C_SDA_PIN);
+    gpio_pull_up(INA219_I2C_SCL_PIN);
+    return 0;
+}
+
+uint8_t ina700_i2c_deinit() {
+    return 0;
+}
+
+uint8_t power_init_ina700() {
     uint8_t res;
 
-    // Initialize handle
+    printf("Trying to initialize INA700 at address 0x44...\n");
+
+    /* Initialize handle */
+    DRIVER_INA700_LINK_INIT(&ina700, ina700_handle_t);
+
+    /* Link functions */
+    DRIVER_INA700_LINK_IIC_INIT(&ina700, ina700_i2c_init);
+    DRIVER_INA700_LINK_IIC_DEINIT(&ina700, ina700_i2c_deinit);
+    DRIVER_INA700_LINK_IIC_READ(&ina700, ina700_i2c_read);
+    DRIVER_INA700_LINK_IIC_WRITE(&ina700, ina700_i2c_write);
+    DRIVER_INA700_LINK_DELAY_MS(&ina700, sleep_ms);
+    DRIVER_INA700_LINK_DEBUG_PRINT(&ina700, printf);
+
+    /* Set I2C address - INA700 at 0x44 */
+    res = ina700_set_addr_pin(&ina700, 0x44);
+    if (res != 0) {
+        printf("ina700: set addr pin failed\n");
+        return res;
+    }
+
+    /* Initialize the chip */
+    res = ina700_init(&ina700);
+    if (res != 0) {
+        printf("ina700: init failed.\n");
+        return res;
+    }
+
+    /* Set continuous shunt and bus voltage mode */
+    res = ina700_set_mode(&ina700, INA700_MODE_SHUNT_BUS_CONTINUOUS);
+    if (res != 0) {
+        printf("ina700: set mode failed.\n");
+        return res;
+    }
+
+    /* Set conversion times for bus and shunt voltage (540µs is a good balance) */
+    res = ina700_set_bus_voltage_conv_time(&ina700, INA700_CONV_TIME_540_US);
+    if (res != 0) {
+        printf("ina700: set bus voltage conv time failed.\n");
+        return res;
+    }
+
+    res = ina700_set_shunt_voltage_conv_time(&ina700, INA700_CONV_TIME_540_US);
+    if (res != 0) {
+        printf("ina700: set shunt voltage conv time failed.\n");
+        return res;
+    }
+
+    /* Set averaging mode (1 sample for fastest response) */
+    res = ina700_set_avg_mode(&ina700, INA700_AVG_1);
+    if (res != 0) {
+        printf("ina700: set avg mode failed.\n");
+        return res;
+    }
+
+    printf("INA700 initialized successfully.\n");
+    return 0;
+}
+
+uint8_t power_init_ina219() {
+    uint8_t res;
+
+    printf("Trying to initialize INA219 at address 0x40...\n");
+
+    /* Initialize handle */
     DRIVER_INA219_LINK_INIT(&ina219, ina219_handle_t);
 
-    // Link functions
+    /* Link functions */
     DRIVER_INA219_LINK_IIC_INIT(&ina219, ina219_i2c_init);
-    DRIVER_INA219_LINK_IIC_DEINIT(&ina219, ina219_i2c_deinit); 
+    DRIVER_INA219_LINK_IIC_DEINIT(&ina219, ina219_i2c_deinit);
     DRIVER_INA219_LINK_IIC_READ(&ina219, ina219_i2c_read);
     DRIVER_INA219_LINK_IIC_WRITE(&ina219, ina219_i2c_write);
     DRIVER_INA219_LINK_DELAY_MS(&ina219, sleep_ms);
     DRIVER_INA219_LINK_DEBUG_PRINT(&ina219, printf);
 
-ina219_i2c_init();
-    // Set I2C address
+    /* Set I2C address */
     res = ina219_set_addr_pin(&ina219, 0x40);
     if (res != 0) {
-        printf("ina219: set addr pin failed \n");
+        printf("ina219: set addr pin failed\n");
         return res;
     }
-    /* set the r */
+
+    /* Set the shunt resistance (0.01 ohm = 10 milliohm) */
     res = ina219_set_resistance(&ina219, 0.01);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: set resistance failed.\n");
         return res;
     }
-    
-    /* init */
+
+    /* Initialize the chip */
     res = ina219_init(&ina219);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: init failed.\n");
         return res;
     }
-    
-    /* set bus voltage range */
+
+    /* Set bus voltage range */
     res = ina219_set_bus_voltage_range(&ina219, INA219_BUS_VOLTAGE_RANGE_32V);
-    if (res != 0)
-    {
-        printf("ina219: set bus voltage range failed.\n");        
+    if (res != 0) {
+        printf("ina219: set bus voltage range failed.\n");
         return res;
     }
-    
-    /* set bus voltage adc mode */
+
+    /* Set bus voltage adc mode */
     res = ina219_set_bus_voltage_adc_mode(&ina219, INA219_ADC_MODE_12_BIT_1_SAMPLES);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: set bus voltage adc mode failed.\n");
         return res;
     }
 
-    /* set shunt voltage adc mode */
+    /* Set shunt voltage adc mode */
     res = ina219_set_shunt_voltage_adc_mode(&ina219, INA219_ADC_MODE_12_BIT_1_SAMPLES);
-    if (res != 0)
-    {
-        printf("ina219: set shunt voltage adc mode failed.\n");        
+    if (res != 0) {
+        printf("ina219: set shunt voltage adc mode failed.\n");
         return res;
     }
-    
-    /* set shunt bus voltage continuous */
+
+    /* Set shunt bus voltage continuous */
     res = ina219_set_mode(&ina219, INA219_MODE_SHUNT_BUS_VOLTAGE_CONTINUOUS);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: set mode failed.\n");
         return res;
     }
-    
-    /* set pga */
+
+    /* Set pga */
     res = ina219_set_pga(&ina219, INA219_PGA_160_MV);
-    if (res != 0)
-    {
-        printf("ina219: set pga failed.\n");        
+    if (res != 0) {
+        printf("ina219: set pga failed.\n");
         return res;
     }
-    
+
     uint16_t calibration;
-    /* calculate calibration */
+    /* Calculate calibration */
     res = ina219_calculate_calibration(&ina219, (uint16_t *)&calibration);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: calculate calibration failed.\n");
         return res;
     }
-    
-    /* set calibration */
+
+    /* Set calibration */
     res = ina219_set_calibration(&ina219, calibration);
-    if (res != 0)
-    {
+    if (res != 0) {
         printf("ina219: set calibration failed.\n");
         return res;
     }
 
+    printf("INA219 initialized successfully.\n");
     return 0;
+}
+
+uint8_t power_init() {
+    /* Initialize I2C first */
+    ina219_i2c_init();
+
+    /* Try INA700 first (address 0x44) */
+    if (power_init_ina700() == 0) {
+        active_power_monitor = POWER_MONITOR_INA700;
+        printf("Power monitor: INA700 active\n");
+        return 0;
+    }
+
+    /* If INA700 fails, try INA219 (address 0x40) */
+    if (power_init_ina219() == 0) {
+        active_power_monitor = POWER_MONITOR_INA219;
+        printf("Power monitor: INA219 active\n");
+        return 0;
+    }
+
+    /* No power monitor found */
+    active_power_monitor = POWER_MONITOR_NONE;
+    printf("Warning: No power monitor found!\n");
+    return 1;
 }
 
 uint8_t ina219_basic_read(float *mV, float *mA, float *mW)
@@ -295,22 +425,64 @@ uint8_t ina219_basic_read(float *mV, float *mA, float *mW)
     {
         return 1;
     }
-    
+
     /* read current */
     res = ina219_read_current(&ina219, (int16_t *)&s_raw, mA);
     if (res != 0)
     {
         return 1;
     }
-    
+
     /* read power */
     res = ina219_read_power(&ina219, (uint16_t *)&u_raw, mW);
     if (res != 0)
     {
         return 1;
     }
-    
+
     return 0;
+}
+
+uint8_t ina700_basic_read(float *mV, float *mA, float *mW)
+{
+    uint8_t res;
+    int16_t s_raw;
+    uint32_t u_raw;
+
+    /* read bus voltage */
+    res = ina700_read_bus_voltage(&ina700, &s_raw, mV);
+    if (res != 0)
+    {
+        return 1;
+    }
+
+    /* read current */
+    res = ina700_read_current(&ina700, &s_raw, mA);
+    if (res != 0)
+    {
+        return 1;
+    }
+
+    /* read power */
+    res = ina700_read_power(&ina700, &u_raw, mW);
+    if (res != 0)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+uint8_t power_basic_read(float *mV, float *mA, float *mW)
+{
+    switch (active_power_monitor) {
+        case POWER_MONITOR_INA700:
+            return ina700_basic_read(mV, mA, mW);
+        case POWER_MONITOR_INA219:
+            return ina219_basic_read(mV, mA, mW);
+        default:
+            return 1;
+    }
 }
 
 int main()
@@ -364,7 +536,7 @@ int main()
         watchdog_update();
 
         printf("Uptime: %llu s\n", time_us_64() / 1000000);
-        if (ina219_basic_read(&voltage, &current, &power) == 0) {
+        if (power_basic_read(&voltage, &current, &power) == 0) {
             int power_state = gpio_get(PWR_PIN);
             uint8_t restore_mode = get_restore_mode();
 
@@ -376,8 +548,8 @@ int main()
             snprintf(uart_msg, sizeof(uart_msg), "%d;%.2f;%.2f;%.2f;%d\n", power_state, voltage, current, power, restore_mode);
             uart_puts(UART_ID, uart_msg);
         } else {
-            printf("Error reading INA219\n");
-            uart_puts(UART_ID, "Error reading INA219\n");
+            printf("Error reading power monitor\n");
+            uart_puts(UART_ID, "Error reading power monitor\n");
         }
 
         sleep_ms(1000);
